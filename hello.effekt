@@ -1,0 +1,310 @@
+import mutable/array
+import text/string
+
+extern """
+  const readline = require('node:readline');
+"""
+
+interface Console {
+  def readline(prompt: String): String
+}
+
+namespace js {
+  extern type JSConsole
+  extern {io} def newConsole(): JSConsole =
+    """readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      })"""
+  extern {io} def close(console: JSConsole): Unit = "${console}.close()"
+  extern {io} def readline(console: JSConsole, prompt: String, k: String => Unit at {io, control}): Unit =
+     "${console}.question(${prompt}, input => (${k})(input).run())"
+}
+
+def withConsole(prog: () => Unit / Console at {io, control}): Unit = {
+  val c = js::newConsole()
+  try { prog(); js::close(c) } with Console {
+    def readline(prompt) = js::readline(c, prompt, resume)
+
+  }
+}
+
+type Tile {
+  X();
+  O()
+}
+
+record Board(tiles: List[List[Option[Tile]]])
+
+def newBoard(): Board = Board(fill(3, fill(3, None())))
+
+def showBoard(b: Board): String = b match {
+  case Board(tiles) =>
+    val strings = tiles.map { showRow };
+    join("\n-+-+-\n", strings)
+}
+
+def showRow(row: List[Option[Tile]]): String = {
+  val strings = row.map { showTileOpt };
+  join("|", strings)
+}
+
+def join(sep: String, list: List[String]): String = list match {
+  case Nil() => ""
+  case Cons(hd, Nil()) => hd
+  case Cons(hd, tl) => hd ++ sep ++ join(sep, tl)
+}
+
+def showTileOpt(tile: Option[Tile]): String = tile match {
+  case Some(X()) => "X"
+  case Some(O()) => "O"
+  case None() => " "
+}
+
+record TileOccupied()
+
+def updateBoard(b: Board, row: Int, col: Int, tile: Tile): Board / {Exception[OutOfBounds], Exception[TileOccupied]} = {
+  getTile(b, row, col) match {
+    case Some(_) => do raise(TileOccupied(), "")
+    case None() => setTile(b, row, col, tile)
+  }
+}
+
+def getTile(b: Board, row: Int, col: Int): Option[Tile] / Exception[OutOfBounds] = b match {
+  case Board(tiles) => get(get(tiles, row), col)
+}
+
+def setTile(b: Board, row: Int, col: Int, tile: Tile): Board / Exception[OutOfBounds] = b match {
+  case Board(tiles) =>
+    val oldRow = get(tiles, row)
+    val newRow = set(oldRow, col, Some(tile))
+    val newTiles = set(tiles, row, newRow)
+    Board(newTiles)
+}
+
+def set[A](l: List[A], n: Int, x: A): List[A] / Exception[OutOfBounds] = (l, n) match {
+  case (Nil(), _) => do raise(OutOfBounds(), "")
+  case (Cons(_, tl), 0) => Cons(x, tl)
+  case (Cons(hd, tl), n) => Cons(hd, set(tl, n - 1, x))
+}
+
+def askPlayerTile(): Tile / Console = {
+  var tile = X()
+  loop {
+    val input = do readline("Choose a tile [X/O]: ")
+    input match {
+      case "X" => tile = X(); do break()
+      case "O" => tile = O(); do break()
+      case _ =>
+        println("Invalid tile choice.")
+        do continue()
+    }
+  } 
+  tile
+}
+
+
+
+def askPlayerMove(): (Int, Int) / Console = {
+  var move = (-1, -1)
+  loop {
+    val input = do readline("Choose a move: [row, col]: ")
+    input.split(",").toList[String]() match {
+      case Cons(rowString, Cons(colString, Nil())) =>
+        (rowString.trim().toInt(), colString.trim().toInt()) match {
+          case (Some(row), Some(col)) => 
+            move = (row, col)
+            do break()
+          case _ => println("Invalid input."); do continue()
+        }
+      case _ => println("Invalid input."); do continue()
+    }
+  }
+  move
+}
+
+def opposite(tile: Tile): Tile = tile match {
+  case X() => O()
+  case O() => X()
+}
+
+def getRandomValidMove(b: Board): (Int, Int) = {
+  val validMoves = getValidMoves(b)
+  val i = floor(random() * toDouble(validMoves.size))
+  myPanicOn[OutOfBounds, (Int, Int)] { immutable::list::get(validMoves, i) }
+}
+
+def myPanicOn[E, A] { prog: => A / Exception[E] }: A =
+  try { prog() } with Exception[E] { def raise(exception: E, msg: String) = panic(msg) }
+
+def getValidMoves(b: Board): List[(Int, Int)] = {
+  var list = Nil()
+  ignoring[OutOfBounds] {
+    each(0, 3) { row => 
+      each(0, 3) { col =>
+        getTile(b, row, col) match {
+          case Some(_) => ()
+          case None() => list = Cons((row, col), list)
+        }
+      }
+    }
+  }
+  list
+}
+
+
+type Result {
+  Winner(tile: Tile);
+  Draw();
+  Continue()
+}
+
+type Future {
+  Victory();
+  Defeat();
+  Tie()
+}
+
+def getBestMove(b: Board, player: Tile): Tuple3[Int, Int, Future] = {
+  // all the moves I can do
+  val moves = getValidMoves(b)
+  // the boards after I do my move
+
+  val nextBoards = immutable::list::map(moves) {
+    case (row, col) => myPanicOn[TileOccupied, Board] { myPanicOn[OutOfBounds, Board] { updateBoard(b, row, col, player) } }
+  }
+
+
+  // opponent's best moves with these boards
+  val futures = nextBoards.map {
+    b => 
+      getResult(b) match {
+        case Winner(winner) => if (winner == player) Defeat() else Victory()
+        case Draw() => Tie()
+        case Continue() =>
+          val (_, _, future) = getBestMove(b, opposite(player))
+          future
+      }
+  }
+
+  val moveFutures = zip(moves, futures)
+
+  val victories = immutable::list::collect(moveFutures) { 
+    case ((row, col), Defeat()) => Some((row, col, Victory()))
+    case _ => None()
+  }
+  
+  val ties = immutable::list::collect(moveFutures) { 
+    case ((row, col), Tie()) => Some((row, col, Tie()))
+    case _ => None()
+  }
+
+  val defeats = immutable::list::collect(moveFutures) { 
+    case ((row, col), Victory()) => Some((row, col, Defeat()))
+    case _ => None()
+  } 
+
+  val all = victories.append(ties).append(defeats)
+  myHead(all)
+}
+
+def myHead[A](l: List[A]): A = l match {
+  case Nil() => panic("asdf")
+  case Cons(hd, _) => hd
+}
+
+
+
+def myEquals(x: Option[Tile], y: Option[Tile]) = (x, y) match {
+  case (None(), None()) => true
+  case (Some(x1), Some(y1)) => x1 == y1
+  case _ => false
+}
+
+def getResult(b: Board): Result = {
+  val winningLines = [
+    [(0, 0), (0, 1), (0, 2)],
+    [(1, 0), (1, 1), (1, 2)],
+    [(2, 0), (2, 1), (2, 2)],
+
+    [(0, 0), (1, 0), (2, 0)],
+    [(0, 1), (1, 1), (2, 1)],
+    [(0, 2), (1, 2), (2, 2)],
+
+    [(0, 0), (1, 1), (2, 2)],
+    [(0, 2), (1, 1), (2, 0)]
+  ]
+
+  var result = Draw()
+  immutable::list::foreach(winningLines) {
+    coords => 
+      val line = immutable::list::map(coords) { case (row, col) => myPanicOn[OutOfBounds, Option[Tile]] { getTile(b, row, col) } }
+      if (line.all { t => myEquals(t, Some(X())) }) {
+        result = Winner(X())
+        do break()
+      } else if (line.all { t => myEquals(t, Some(O())) }) {
+        result = Winner(O())
+        do break()
+      } else if (line.any { t => t == None() }) {
+        result = Continue()
+      }
+  }
+  result
+}
+
+def main() = withConsole(box {
+  val playerTile = askPlayerTile()
+  var activeTile = X()
+  var board = newBoard()
+
+  loop {
+    getResult(board) match {
+      case Winner(tile) =>
+        if (tile == playerTile) {
+          println("You win!")
+          do break()
+        } else {
+          println("You lose!")
+          do break()
+        }
+      case Draw() =>
+        println("It's a draw!")
+        do break()
+      case Continue() =>
+        ()
+    }
+
+    if (playerTile == activeTile) {
+      loop {
+        try {
+          val (row, col) = askPlayerMove()
+          board = updateBoard(board, row, col, playerTile)
+          do break()
+        } with Exception[OutOfBounds] {
+          def raise(_, _) = {
+            println("Unavailable square.")
+            do continue()
+          }
+        } with Exception[TileOccupied] {
+          def raise(_, _) = {
+            println("Square occupied.")
+            do continue()
+          }
+        }
+      }
+    } else {
+      val (row, col, _) = getBestMove(board, activeTile)
+      println("Opponent plays " ++ row.show ++ ", " ++ col.show)
+      panicOn[TileOccupied] {
+        panicOn[OutOfBounds] {
+          board = updateBoard(board, row, col, activeTile)
+        }
+      }
+    }
+
+    activeTile = opposite(activeTile)
+
+    println(showBoard(board))
+  }
+
+})
